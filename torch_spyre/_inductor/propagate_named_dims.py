@@ -371,8 +371,13 @@ def _log_op(op: Operation) -> None:
 def _propagate_named_dims_impl(graph: GraphLowering) -> None:
     operations = graph.operations
     if graph.graph_input_names:
-        for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
-            if isinstance(real_input, torch.Tensor):
+        inputs_to_zip = (
+            graph.example_inputs if graph.is_backward else V.get_real_inputs()
+        )
+        for name, real_input in zip(graph.graph_input_names, inputs_to_zip):
+            if isinstance(real_input, torch.Tensor) and hasattr(
+                real_input, "device_tensor_layout"
+            ):
                 tb = graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)

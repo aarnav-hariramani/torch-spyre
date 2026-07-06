@@ -35,6 +35,7 @@ def enable_spyre_compile_fx_wrapper():
         if getattr(cfx, "_spyre_wrapped", False):
             return
         _orig = cfx.compile_fx
+        _orig_bw = cfx.compile_fx_backward
 
         # Iterate over producer nodes (supports nested containers of nodes)
         def iter_nodes(x):
@@ -70,7 +71,9 @@ def enable_spyre_compile_fx_wrapper():
             out_puts = out_node.args[0] if out_node.args else []
             for n in iter_nodes(out_puts):
                 meta = getattr(n, "meta", {}) or {}
-                mv = meta.get("val", None) or meta.get("example_value", None)
+                mv = meta.get("val", None)
+                if mv is None:
+                    mv = meta.get("example_value", None)
                 if mv is None:
                     continue
 
@@ -119,7 +122,23 @@ def enable_spyre_compile_fx_wrapper():
 
             return _orig(gm, example_inputs, *args, **kwargs)
 
+        @wraps(_orig_bw)
+        def _bw_wrapper(gm, example_inputs, compiler_config_extra, **kwargs):
+            # The backward graph is compiled lazily (on first .backward() call),
+            # outside the enable_spyre_context that wrapped compile_fx.  We need
+            # to re-enter the context so that all Spyre pre-scheduling passes
+            # (propagate_spyre_tensor_layouts, finalize_layouts, etc.) run.
+            # Use empty example_inputs for V.set_real_inputs - the backward
+            # compiler uses graph.example_inputs (FakeTensors) for layout
+            # propagation anyway (graph.is_backward == True).
+            if _uses_spyre(gm, example_inputs):
+                decomps = torch._inductor.decomposition.decompositions
+                with enable_spyre_context([], decomps=decomps):
+                    return _orig_bw(gm, example_inputs, compiler_config_extra, **kwargs)
+            return _orig_bw(gm, example_inputs, compiler_config_extra, **kwargs)
+
         cfx.compile_fx = _wrapper
+        cfx.compile_fx_backward = _bw_wrapper
         cfx._spyre_wrapped = True
 
 

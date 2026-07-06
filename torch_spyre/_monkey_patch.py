@@ -262,7 +262,7 @@ def _patch_fx_graph_hash():
     """
     import torch
     from torch._inductor.codecache import FxGraphHashDetails
-    from torch._inductor.virtualized import V
+    from torch._inductor.virtualized import V, NullHandler
 
     if getattr(FxGraphHashDetails, "_spyre_hash_patched", False):
         return
@@ -273,25 +273,20 @@ def _patch_fx_graph_hash():
         # run original first — populates all standard hash fields
         original_init(self, gm, example_inputs, fx_kwargs, inputs_to_check)
 
-        # V.get_real_inputs() returns real Spyre tensors with SpyreTensorLayout
-        # before they become FakeTensors (which have no layout by design)
+        # For the forward graph, V.get_real_inputs() holds the actual Spyre tensors
+        # (with device_tensor_layout) and should be used for the cache key.
+        # For the backward graph, the backward compiler is called directly by
+        # AOTAutograd without going through compile_fx, so V.get_real_inputs() still
+        # points at the forward inputs — fall back to example_inputs (FakeTensors)
+        # which have no device_tensor_layout, contributing None to the hash.
+        real_inputs = V.get_real_inputs()
+        if isinstance(real_inputs, NullHandler):
+            real_inputs = example_inputs
 
-        try:
-            real_inputs = V.get_real_inputs()
-        except RuntimeError:
-            return
-
-        # extract layout from real tensors, fallback to example_inputs
         spyre_layouts = []
-        # Use real_inputs only if it's a valid list/tuple, otherwise use example_inputs
-        inputs_to_use = (
-            real_inputs if isinstance(real_inputs, (list, tuple)) else example_inputs
-        )
-
-        for inp in inputs_to_use:
-            if isinstance(inp, torch.Tensor):
-                layout = inp.device_tensor_layout()
-                spyre_layouts.append(layout)
+        for inp in real_inputs:
+            if isinstance(inp, torch.Tensor) and hasattr(inp, "device_tensor_layout"):
+                spyre_layouts.append(inp.device_tensor_layout())
             else:
                 spyre_layouts.append(None)
 

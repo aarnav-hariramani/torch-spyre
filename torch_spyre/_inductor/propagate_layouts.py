@@ -53,7 +53,6 @@ from .constants import (
     BATCH_MATMUL_OP,
     COPY_BACK_CANDIDATE_ATTR,
     ELIDED_COPY_BACK_ATTR,
-    REDUCTIONS_NON_STICK_DIM_ONLY,
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
@@ -172,19 +171,13 @@ def _candidate_output_stls(
     c_size: list,
     c_stride: list,
     stick_size: int,
-    skip_stick_expr: sympy.Expr,
 ) -> list[SpyreTensorLayout]:
-    """Enumerate candidate output STLs by trying each dim as the stick.
+    """Enumerate candidate output STLs by trying each non-last dim as the stick.
 
-    Skip the dim that already produces an unsupported stick.
+    Skips any candidate whose resulting device stick expression has an offset.
     """
-    out_coords = host_coordinates(output, output_dep, None)
-    skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
-
     result = []
-    for alt_stick_dim in range(len(output.size)):
-        if alt_stick_dim == skip_dim:
-            continue
+    for alt_stick_dim in range(len(output.size) - 1):
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
             # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
             continue
@@ -231,34 +224,23 @@ def _single_arg_op_layout(
 
     if isinstance(data, Reduction):
         x_dev_coords = device_coordinates(stl, dep, None)
+        out_coords = host_coordinates(output, output_dep, None)
         x_stick_expr = x_dev_coords[-1]
-        reduction_var = next(
-            iter(dep.index.free_symbols - output_dep.index.free_symbols), None
-        )
 
-        # Do not preserve the input layout for reduction ops listed in
-        # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
-        # dimension. Those reductions are currently unsupported in the backend.
-        # See backend issue #4409.
-        if not (
-            data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
-            and reduction_var in x_stick_expr.free_symbols
-        ):
-            # Try to preserve input layout
-            out_stl = _output_stl_from_stick_expr(
-                x_stick_expr, output, output_dep, c_size, c_stride
-            )
-            if out_stl is not None:
-                return [out_stl]
+        # Try to preserve input layout
+        out_stl = _output_stl_from_stick_expr(
+            x_stick_expr, output, output_dep, c_size, c_stride
+        )
+        if out_stl is not None:
+            return [out_stl]
 
         # Try alternative layouts when input layout is not supported
         in_coords = host_coordinates(in_layout, dep, None)
-        out_coords = host_coordinates(output, output_dep, None)
-        stick_dim = matching_dim(in_coords, x_stick_expr)
+        reduction_var = next(
+            iter(dep.index.free_symbols - output_dep.index.free_symbols), None
+        )
         layouts = []
         for in_dim in range(len(in_layout.size)):
-            if in_dim == stick_dim:
-                continue
             if concretize_expr(in_layout.size[in_dim]) % stick_size != 0:
                 # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
                 continue
@@ -360,9 +342,7 @@ def _single_arg_op_layout(
     )
     if out_stl is not None:
         return [out_stl]
-    return _candidate_output_stls(
-        output, output_dep, c_size, c_stride, stick_size, stick_expr
-    )
+    return _candidate_output_stls(output, output_dep, c_size, c_stride, stick_size)
 
 
 def _clone_layout(
@@ -417,7 +397,7 @@ def _clone_layout(
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     required_in_stl = None
     for candidate in _candidate_output_stls(
-        output, output_dep, c_size, c_stride, stick_size, stick_expr
+        output, output_dep, c_size, c_stride, stick_size
     ):
         target_stick = device_coordinates(candidate, output_dep, None)[-1]
         target_stl = compute_restickify_target_layout(
@@ -614,11 +594,13 @@ def _multi_arg_pointwise_layouts(
     """
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
+    # Collect all unique non-zero stick expressions from input layouts
     stick_exprs = {
-        device_coordinates(stl, arg.dep, ind_sizes)[-1]
+        stick_expr
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
+        and (stick_expr := device_coordinates(stl, arg.dep, ind_sizes)[-1]) != 0
     }
 
     # If the indexing and device element size are identical
@@ -858,7 +840,6 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
             [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
         )
         for stick_dim in range(len(c_size))
-        if c_size[stick_dim] > 1  # no sticks of size 1
     ]
     if not layouts:
         layouts = [generic_layout(op)]
@@ -903,34 +884,6 @@ def _target_device_layout(target, name: str):
     if not layouts:
         return None
     return next(iter(layouts))
-
-
-def _find_alt_target_stl(
-    target_layout: FixedLayout,
-    target_stl: SpyreTensorLayout,
-    output_dep: MemoryDep,
-) -> SpyreTensorLayout | None:
-    """
-    Find an alternative SpyreTensorLayout with an offset-free stick expression
-    for a mutation target. Returns None if the current layout is already valid,
-    or raises Unsupported if no valid alternative exists.
-    """
-    stick_size = get_elem_in_stick(target_layout.dtype)
-    write_stick = device_coordinates(target_stl, output_dep, None)[-1]
-    if is_stick_expr_offset_free(write_stick, stick_size):
-        return None
-
-    c_size = [concretize_expr(s) for s in target_layout.size]
-    c_stride = [concretize_expr(s) for s in target_layout.stride]
-    candidates = _candidate_output_stls(
-        target_layout, output_dep, c_size, c_stride, stick_size, write_stick
-    )
-    if not candidates:
-        raise Unsupported(
-            f"no offset-free alternative stick dim for mutation target "
-            f"(write stick {write_stick!r}, size={target_layout.size})"
-        )
-    return candidates[0]
 
 
 def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
@@ -1028,34 +981,58 @@ def propagate_spyre_tensor_layouts(
     graph: GraphLowering,
 ) -> None:
     operations = graph.operations
-    # Convert InputBuffers from FixedLayout to SpyreTensorLayouts
+    # Convert InputBuffers from FixedLayout to SpyreTensorLayouts.
+    # For the forward graph V.get_real_inputs() holds the actual Spyre tensors
+    # (with device_tensor_layout).  For the backward graph, AOTAutograd calls the
+    # backward compiler directly without going through compile_fx, so
+    # V.get_real_inputs() still points at the forward inputs — use
+    # graph.example_inputs (FakeTensors) instead and fall through to the
+    # IR-derived default layout path.
     if len(graph.graph_input_names) > 0:
-        for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
-            if isinstance(real_input, torch.Tensor):
+        inputs_to_zip = (
+            graph.example_inputs if graph.is_backward else V.get_real_inputs()
+        )
+        for name, real_input in zip(graph.graph_input_names, inputs_to_zip):
+            stl = None
+            if isinstance(real_input, torch.Tensor) and hasattr(
+                real_input, "device_tensor_layout"
+            ):
                 stl = real_input.device_tensor_layout()
-                if stl is None:
-                    # All spyre tensors are created with device layouts.
-                    # Therefore we expect all graph inputs to have them.
+                if stl is None and not graph.is_backward:
+                    # All real (non-fake) spyre tensors are created with device
+                    # layouts.  Only raise for the forward graph where we expect
+                    # real inputs; backward inputs are FakeTensors whose
+                    # device_tensor_layout() legitimately returns None.
                     raise Unsupported(
                         f"missing device_tensor_layout on graph input {name}"
                     )
+            if stl is None:
+                # Backward graph inputs (FakeTensors) have no device layout.
+                # Derive a default tiled layout from the IR.
                 tb = graph.graph_inputs[name]
-                if (
-                    not isinstance(tb, TensorBox)
-                    or not isinstance(tb.data, StorageBox)
-                    or not isinstance(tb.data.data, InputBuffer)
+                if not (
+                    isinstance(tb, TensorBox)
+                    and isinstance(tb.data, StorageBox)
+                    and isinstance(tb.data.data, InputBuffer)
                 ):
-                    raise Unsupported(
-                        f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
-                    )
+                    continue
                 ptl = tb.data.data.layout
-                if not isinstance(ptl, FixedLayout):
-                    raise Unsupported(f"graph input {name} does not have a FixedLayout")
-                tb.layouts = [stl]
+                c_size = [concretize_expr(s) for s in ptl.size]
+                stl = SpyreTensorLayout(c_size, ptl.dtype)
 
-    # Alt layout each graph input has been forced to by a mutation write, so a
-    # second write can detect a conflicting alt.
-    forced_mutation_alts: dict[str, SpyreTensorLayout] = {}
+            tb = graph.graph_inputs[name]
+            if (
+                not isinstance(tb, TensorBox)
+                or not isinstance(tb.data, StorageBox)
+                or not isinstance(tb.data.data, InputBuffer)
+            ):
+                raise Unsupported(
+                    f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+                )
+            ptl = tb.data.data.layout
+            if not isinstance(ptl, FixedLayout):
+                raise Unsupported(f"graph input {name} does not have a FixedLayout")
+            tb.layouts = [stl]
 
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the input SpyreTensorLayouts and the operation being
@@ -1069,41 +1046,15 @@ def propagate_spyre_tensor_layouts(
                 target = op.layout.target
                 while isinstance(target, ReinterpretView):
                     target = target.data
-                target_name = target.get_name() if hasattr(target, "get_name") else ""
-                target_stl = _target_device_layout(target, target_name)
+                target_stl = _target_device_layout(
+                    target,
+                    target.get_name() if hasattr(target, "get_name") else "",
+                )
                 if target_stl is None:
                     continue
                 rw = op.get_read_writes()
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
-
-                # Find an alternative layout if the write has an unsupported stick
-                # expression (e.g. offset like v+32). Force the optimizer to use
-                # this layout for the mutation target.
-                target_layout = target.get_layout()
-                if isinstance(target_layout, FixedLayout):
-                    alt_stl = _find_alt_target_stl(
-                        target_layout, target_stl, output_dep
-                    )
-                    if alt_stl is not None:
-                        graph_input = V.graph.graph_inputs.get(target_name)
-                        assert graph_input is not None
-                        # A graph input holds only one device layout, so two
-                        # writes needing different alts cannot both be expressed.
-                        # TODO: support this by chaining relayouts between writes
-                        # through temp buffers.
-                        prior_alt = forced_mutation_alts.get(target_name)
-                        if prior_alt is not None and prior_alt != alt_stl:
-                            raise Unsupported(
-                                f"multiple mutations to graph input {target_name} "
-                                f"require conflicting alternative layouts "
-                                f"({prior_alt!r} vs {alt_stl!r}); chaining "
-                                f"relayouts between writes is not yet supported"
-                            )
-                        forced_mutation_alts[target_name] = alt_stl
-                        graph_input.layouts = [alt_stl]
-                        op._restickify_plan = (target_name, target_stl, alt_stl)
-                        target_stl = alt_stl
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
