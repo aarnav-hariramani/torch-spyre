@@ -17,9 +17,10 @@ from collections import Counter
 from typing import NamedTuple
 
 import logging
-
 import sympy
 import torch
+import torch.fx
+from torch.utils._pytree import tree_leaves
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -53,6 +54,7 @@ from .constants import (
     BATCH_MATMUL_OP,
     COPY_BACK_CANDIDATE_ATTR,
     ELIDED_COPY_BACK_ATTR,
+    REDUCTIONS_NON_STICK_DIM_ONLY,
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
@@ -81,6 +83,48 @@ logger = get_inductor_logger("propagate_layouts")
 prims = torch.ops.prims
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
+
+# ---------------------------------------------------------------------------
+# Forward-output layout registry
+#
+# After the forward graph's layout passes run (finalize_layouts), the pass
+# capture_forward_output_layouts records the committed SpyreTensorLayout of every
+# forward output here, keyed by graph_id (stable across the forward and backward
+# compiles of one AOT graph).  propagate_spyre_tensor_layouts on the backward
+# graph looks these up so its saved-activation inputs get the real STL the forward
+# optimizer chose, not a default derived from shape+dtype (which silently diverges
+# — and for transposed saved activations is not even a valid Spyre stick
+# expression).
+#
+# Each entry maps FX-output-node-name -> STL.  AOTAutograd's partitioner names the
+# backward's saved-activation placeholders after the forward FX nodes that
+# produced them, so FX node names (e.g. "sigmoid", "permute", "primals_2") match
+# backward graph_input_names.  Inductor *buffer* names (e.g. "buf1") never do, so
+# we deliberately key by FX name, not buffer name.
+#
+# Only saved activations are tracked.  A backward "tangents_N" input is NOT a
+# forward output — it is the gradient of the N-th forward user output, whose
+# layout is chosen by the upstream grad producer at .backward() time, not by this
+# forward's output optimizer.  Mapping a tangent to its forward output's layout is
+# unsound (and degenerate for scalar / reduced outputs), so tangents fall through
+# to the IR-derived default instead.
+#
+# Size cap: at most _FWD_LAYOUT_REGISTRY_MAX_GRAPHS entries are kept so the
+# registry cannot grow unboundedly if many graphs are compiled.  Entries are also
+# evicted on first backward-compile consumption.
+#
+# Cache caveat: capture runs as a forward pre-scheduling pass, so it does NOT run
+# when the forward is served from a compile cache.  When both forward and backward
+# are cache hits the correct pre-compiled backward is reused (safe).  If the
+# forward is a cache hit but the backward is recompiled, this registry is empty;
+# rather than silently guess a layout for an unresolved saved activation (risking
+# wrong gradients) the backward pass fails loud.  A fully cache-proof design
+# (serializing these layouts with the cached forward) is left as follow-up.
+# ---------------------------------------------------------------------------
+_FWD_LAYOUT_REGISTRY_MAX_GRAPHS = 64
+
+# graph_id -> {FX-output-node-name: committed forward-output STL}
+_forward_output_layouts: dict[int, dict[str, "SpyreTensorLayout"]] = {}
 
 
 class PropArg(NamedTuple):
@@ -171,13 +215,19 @@ def _candidate_output_stls(
     c_size: list,
     c_stride: list,
     stick_size: int,
+    skip_stick_expr: sympy.Expr,
 ) -> list[SpyreTensorLayout]:
-    """Enumerate candidate output STLs by trying each non-last dim as the stick.
+    """Enumerate candidate output STLs by trying each dim as the stick.
 
-    Skips any candidate whose resulting device stick expression has an offset.
+    Skip the dim that already produces an unsupported stick.
     """
+    out_coords = host_coordinates(output, output_dep, None)
+    skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
+
     result = []
-    for alt_stick_dim in range(len(output.size) - 1):
+    for alt_stick_dim in range(len(output.size)):
+        if alt_stick_dim == skip_dim:
+            continue
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
             # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
             continue
@@ -224,23 +274,34 @@ def _single_arg_op_layout(
 
     if isinstance(data, Reduction):
         x_dev_coords = device_coordinates(stl, dep, None)
-        out_coords = host_coordinates(output, output_dep, None)
         x_stick_expr = x_dev_coords[-1]
-
-        # Try to preserve input layout
-        out_stl = _output_stl_from_stick_expr(
-            x_stick_expr, output, output_dep, c_size, c_stride
-        )
-        if out_stl is not None:
-            return [out_stl]
-
-        # Try alternative layouts when input layout is not supported
-        in_coords = host_coordinates(in_layout, dep, None)
         reduction_var = next(
             iter(dep.index.free_symbols - output_dep.index.free_symbols), None
         )
+
+        # Do not preserve the input layout for reduction ops listed in
+        # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
+        # dimension. Those reductions are currently unsupported in the backend.
+        # See -> backend issue #4409.
+        if not (
+            data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
+            and reduction_var in x_stick_expr.free_symbols
+        ):
+            # Try to preserve input layout
+            out_stl = _output_stl_from_stick_expr(
+                x_stick_expr, output, output_dep, c_size, c_stride
+            )
+            if out_stl is not None:
+                return [out_stl]
+
+        # Try alternative layouts when input layout is not supported
+        in_coords = host_coordinates(in_layout, dep, None)
+        out_coords = host_coordinates(output, output_dep, None)
+        stick_dim = matching_dim(in_coords, x_stick_expr)
         layouts = []
         for in_dim in range(len(in_layout.size)):
+            if in_dim == stick_dim:
+                continue
             if concretize_expr(in_layout.size[in_dim]) % stick_size != 0:
                 # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
                 continue
@@ -342,7 +403,9 @@ def _single_arg_op_layout(
     )
     if out_stl is not None:
         return [out_stl]
-    return _candidate_output_stls(output, output_dep, c_size, c_stride, stick_size)
+    return _candidate_output_stls(
+        output, output_dep, c_size, c_stride, stick_size, stick_expr
+    )
 
 
 def _clone_layout(
@@ -397,7 +460,7 @@ def _clone_layout(
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     required_in_stl = None
     for candidate in _candidate_output_stls(
-        output, output_dep, c_size, c_stride, stick_size
+        output, output_dep, c_size, c_stride, stick_size, stick_expr
     ):
         target_stick = device_coordinates(candidate, output_dep, None)[-1]
         target_stl = compute_restickify_target_layout(
@@ -594,13 +657,11 @@ def _multi_arg_pointwise_layouts(
     """
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
-    # Collect all unique non-zero stick expressions from input layouts
     stick_exprs = {
-        stick_expr
+        device_coordinates(stl, arg.dep, ind_sizes)[-1]
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
-        and (stick_expr := device_coordinates(stl, arg.dep, ind_sizes)[-1]) != 0
     }
 
     # If the indexing and device element size are identical
@@ -840,6 +901,7 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
             [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
         )
         for stick_dim in range(len(c_size))
+        if c_size[stick_dim] > 1  # no sticks of size 1
     ]
     if not layouts:
         layouts = [generic_layout(op)]
@@ -884,6 +946,34 @@ def _target_device_layout(target, name: str):
     if not layouts:
         return None
     return next(iter(layouts))
+
+
+def _find_alt_target_stl(
+    target_layout: FixedLayout,
+    target_stl: SpyreTensorLayout,
+    output_dep: MemoryDep,
+) -> SpyreTensorLayout | None:
+    """
+    Find an alternative SpyreTensorLayout with an offset-free stick expression
+    for a mutation target. Returns None if the current layout is already valid,
+    or raises Unsupported if no valid alternative exists.
+    """
+    stick_size = get_elem_in_stick(target_layout.dtype)
+    write_stick = device_coordinates(target_stl, output_dep, None)[-1]
+    if is_stick_expr_offset_free(write_stick, stick_size):
+        return None
+
+    c_size = [concretize_expr(s) for s in target_layout.size]
+    c_stride = [concretize_expr(s) for s in target_layout.stride]
+    candidates = _candidate_output_stls(
+        target_layout, output_dep, c_size, c_stride, stick_size, write_stick
+    )
+    if not candidates:
+        raise Unsupported(
+            f"no offset-free alternative stick dim for mutation target "
+            f"(write stick {write_stick!r}, size={target_layout.size})"
+        )
+    return candidates[0]
 
 
 def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
@@ -977,38 +1067,165 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         operations.remove(op)
 
 
+def _tangent_output_index(name: str) -> int | None:
+    """Map a backward ``tangents_N`` input name to a 0-based forward-output index.
+
+    ``tangents_1`` -> 0, ``tangents_2`` -> 1, ...  Returns None if ``name`` is not
+    a tangent placeholder.
+    """
+    prefix = "tangents_"
+    if not name.startswith(prefix):
+        return None
+    suffix = name[len(prefix) :]
+    if not suffix.isdigit():
+        return None
+    return int(suffix) - 1
+
+
+def _forward_fx_output_names(graph: GraphLowering) -> list[str | None]:
+    """FX output node names for a forward graph, positionally aligned with
+    ``graph.get_output_names()``.
+
+    ``get_output_names()`` emits exactly one name per ``graph.graph_outputs``
+    entry (in order), and ``graph_outputs`` is built by flattening the FX output
+    node's args in the same order, so the two lists line up index-for-index.  We
+    return ``None`` for any output leaf that is not an ``fx.Node`` (SymInt / None
+    constants) to preserve that alignment.
+    """
+    try:
+        gm = graph.module
+        out_node = next(n for n in gm.graph.nodes if n.op == "output")
+    except (AttributeError, StopIteration):
+        return []
+    names: list[str | None] = []
+    for leaf in tree_leaves(out_node.args[0]):
+        names.append(leaf.name if isinstance(leaf, torch.fx.Node) else None)
+    return names
+
+
+def capture_forward_output_layouts(graph: GraphLowering) -> None:
+    """Record each forward output's committed SpyreTensorLayout, keyed by FX name.
+
+    Runs as a pre-scheduling pass after the layout passes (finalize_layouts) on
+    forward graphs (graph.is_backward is False).  At this point every output
+    buffer carries a committed FixedTiledLayout; earlier passes (e.g.
+    propagate_spyre_tensor_layouts) run before layouts are finalized and would
+    see device_layout=None.
+
+    The backward graph is compiled later, outside the forward's
+    enable_spyre_context, so its example_inputs are FakeTensors with no
+    device_tensor_layout.  Its saved-activation inputs are outputs of THIS
+    forward graph, so the STLs recorded here are exactly what those backward
+    inputs must use.  (Tangent inputs are deliberately not recorded — see the
+    _forward_output_layouts registry comment.)
+
+    Entries are evicted when the backward compile consumes them; a size cap
+    (_FWD_LAYOUT_REGISTRY_MAX_GRAPHS) is a backstop against leaks.
+    """
+    if graph.is_backward:
+        return
+    graph_id = graph.graph_id
+    if graph_id is None:
+        return
+
+    buffer_names = graph.get_output_names()
+    fx_names = _forward_fx_output_names(graph)
+
+    by_name: dict[str, SpyreTensorLayout] = {}
+    for i, buf_name in enumerate(buffer_names):
+        fx_name = fx_names[i] if i < len(fx_names) else None
+        if fx_name is None:
+            continue
+        buf = graph.try_get_buffer(buf_name)
+        if buf is None:
+            continue
+        layout = buf.get_layout()
+        if isinstance(layout, FixedTiledLayout) and layout.device_layout is not None:
+            # Key by FX node name (matches backward placeholder names), not the
+            # inductor buffer name.
+            by_name[fx_name] = layout.device_layout
+
+    if not by_name:
+        return
+
+    # Evict oldest entries if at capacity.
+    if len(_forward_output_layouts) >= _FWD_LAYOUT_REGISTRY_MAX_GRAPHS:
+        oldest = next(iter(_forward_output_layouts))
+        del _forward_output_layouts[oldest]
+
+    _forward_output_layouts[graph_id] = by_name
+    logger.debug(
+        "capture_forward_output_layouts: graph_id=%s recorded %d output "
+        "layouts (%s) from buffers=%s",
+        graph_id,
+        len(by_name),
+        list(by_name.keys()),
+        buffer_names,
+    )
+
+
 def propagate_spyre_tensor_layouts(
     graph: GraphLowering,
 ) -> None:
     operations = graph.operations
     # Convert InputBuffers from FixedLayout to SpyreTensorLayouts.
-    # For the forward graph V.get_real_inputs() holds the actual Spyre tensors
-    # (with device_tensor_layout).  For the backward graph, AOTAutograd calls the
-    # backward compiler directly without going through compile_fx, so
-    # V.get_real_inputs() still points at the forward inputs — use
-    # graph.example_inputs (FakeTensors) instead and fall through to the
-    # IR-derived default layout path.
+    #
+    # Forward graph: V.get_real_inputs() holds the actual Spyre tensors with
+    # their physical device_tensor_layout — use those directly.
+    #
+    # Backward graph: AOTAutograd calls compile_fx_backward outside the forward's
+    # enable_spyre_context, so example_inputs are FakeTensors.  FakeTensors return
+    # None from device_tensor_layout() by design (no real SpyreTensorImpl storage).
+    # Instead, look up the saved-activation layouts recorded by
+    # capture_forward_output_layouts (keyed by graph_id) — a backward saved
+    # activation is a forward output, matched by its FX output-node name.  Tangent
+    # inputs are the gradients of the forward user outputs; their layout is set by
+    # the upstream grad producer, not by this forward, so they fall through to an
+    # IR-derived default.  A non-tangent input that is NOT in the registry means
+    # the forward layouts are unavailable (forward served from a compile cache);
+    # we fail loud rather than guess and risk wrong gradients.
     if len(graph.graph_input_names) > 0:
+        if graph.is_backward:
+            # Retrieve (and evict) the forward output layouts for this AOT graph.
+            graph_id = graph.graph_id
+            fwd_by_name: dict[str, SpyreTensorLayout] = {}
+            if graph_id is not None and graph_id in _forward_output_layouts:
+                fwd_by_name = _forward_output_layouts.pop(graph_id)
+                logger.debug(
+                    "propagate_spyre_tensor_layouts: backward graph_id=%s "
+                    "consuming %d forward saved-activation layouts",
+                    graph_id,
+                    len(fwd_by_name),
+                )
+
         inputs_to_zip = (
             graph.example_inputs if graph.is_backward else V.get_real_inputs()
         )
         for name, real_input in zip(graph.graph_input_names, inputs_to_zip):
             stl = None
-            if isinstance(real_input, torch.Tensor) and hasattr(
+            if graph.is_backward:
+                # Saved activation — exact FX output-node name match.
+                stl = fwd_by_name.get(name)
+                if stl is not None:
+                    logger.debug(
+                        "propagate_spyre_tensor_layouts: backward input %r "
+                        "matched forward saved-activation layout %r",
+                        name,
+                        stl,
+                    )
+            elif isinstance(real_input, torch.Tensor) and hasattr(
                 real_input, "device_tensor_layout"
             ):
                 stl = real_input.device_tensor_layout()
-                if stl is None and not graph.is_backward:
-                    # All real (non-fake) spyre tensors are created with device
-                    # layouts.  Only raise for the forward graph where we expect
-                    # real inputs; backward inputs are FakeTensors whose
-                    # device_tensor_layout() legitimately returns None.
+                if stl is None:
+                    # All real Spyre tensors are created with device layouts.
                     raise Unsupported(
                         f"missing device_tensor_layout on graph input {name}"
                     )
+
             if stl is None:
-                # Backward graph inputs (FakeTensors) have no device layout.
-                # Derive a default tiled layout from the IR.
+                # Backward input with no registry match (tangent, SymInt, or
+                # BackwardState).  Try to derive a default layout from the IR.
                 tb = graph.graph_inputs[name]
                 if not (
                     isinstance(tb, TensorBox)
@@ -1016,9 +1233,37 @@ def propagate_spyre_tensor_layouts(
                     and isinstance(tb.data.data, InputBuffer)
                 ):
                     continue
+                if graph.is_backward and _tangent_output_index(name) is None:
+                    # A real tensor backward input that is neither a matched saved
+                    # activation nor a tangent.  Its true layout is a forward
+                    # output we should have recorded; not finding it means the
+                    # forward was served from a compile cache (so capture did not
+                    # run).  Guessing a shape-derived default risks silently wrong
+                    # gradients, so fail loud instead.  A fully cache-proof design
+                    # (persisting these layouts with the cached forward) is
+                    # follow-up work.
+                    raise Unsupported(
+                        f"backward saved-activation input {name!r} has no recorded "
+                        f"forward layout (graph_id={graph.graph_id}); the forward "
+                        f"graph was likely served from a compile cache so its "
+                        f"output layouts were not captured. Recompile with "
+                        f"TORCHINDUCTOR_FORCE_DISABLE_CACHES=1, or clear the "
+                        f"inductor cache, to compile the forward and backward "
+                        f"together."
+                    )
                 ptl = tb.data.data.layout
                 c_size = [concretize_expr(s) for s in ptl.size]
                 stl = SpyreTensorLayout(c_size, ptl.dtype)
+                if graph.is_backward:
+                    # Tangent: its layout is determined by the upstream grad_fn
+                    # output, not known at compile time.  Derive a default
+                    # (last-dim stick) and log it so mismatches are visible.
+                    logger.debug(
+                        "propagate_spyre_tensor_layouts: backward tangent %r "
+                        "using IR-derived default layout %r",
+                        name,
+                        stl,
+                    )
 
             tb = graph.graph_inputs[name]
             if (
@@ -1034,6 +1279,10 @@ def propagate_spyre_tensor_layouts(
                 raise Unsupported(f"graph input {name} does not have a FixedLayout")
             tb.layouts = [stl]
 
+    # Alt layout each graph input has been forced to by a mutation write, so a
+    # second write can detect a conflicting alt.
+    forced_mutation_alts: dict[str, SpyreTensorLayout] = {}
+
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the input SpyreTensorLayouts and the operation being
     # performed to compute the set of possible output SpyreTensorLayouts.
@@ -1046,15 +1295,41 @@ def propagate_spyre_tensor_layouts(
                 target = op.layout.target
                 while isinstance(target, ReinterpretView):
                     target = target.data
-                target_stl = _target_device_layout(
-                    target,
-                    target.get_name() if hasattr(target, "get_name") else "",
-                )
+                target_name = target.get_name() if hasattr(target, "get_name") else ""
+                target_stl = _target_device_layout(target, target_name)
                 if target_stl is None:
                     continue
                 rw = op.get_read_writes()
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
+
+                # Find an alternative layout if the write has an unsupported stick
+                # expression (e.g. offset like v+32). Force the optimizer to use
+                # this layout for the mutation target.
+                target_layout = target.get_layout()
+                if isinstance(target_layout, FixedLayout):
+                    alt_stl = _find_alt_target_stl(
+                        target_layout, target_stl, output_dep
+                    )
+                    if alt_stl is not None:
+                        graph_input = V.graph.graph_inputs.get(target_name)
+                        assert graph_input is not None
+                        # A graph input holds only one device layout, so two
+                        # writes needing different alts cannot both be expressed.
+                        # TODO: support this by chaining relayouts between writes
+                        # through temp buffers.
+                        prior_alt = forced_mutation_alts.get(target_name)
+                        if prior_alt is not None and prior_alt != alt_stl:
+                            raise Unsupported(
+                                f"multiple mutations to graph input {target_name} "
+                                f"require conflicting alternative layouts "
+                                f"({prior_alt!r} vs {alt_stl!r}); chaining "
+                                f"relayouts between writes is not yet supported"
+                            )
+                        forced_mutation_alts[target_name] = alt_stl
+                        graph_input.layouts = [alt_stl]
+                        op._restickify_plan = (target_name, target_stl, alt_stl)
+                        target_stl = alt_stl
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
