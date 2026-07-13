@@ -109,9 +109,17 @@ spyreop = torch.ops.spyre
 # unsound (and degenerate for scalar / reduced outputs), so tangents fall through
 # to the IR-derived default instead.
 #
-# Size cap: at most _FWD_LAYOUT_REGISTRY_MAX_GRAPHS entries are kept so the
-# registry cannot grow unboundedly if many graphs are compiled.  Entries are also
-# evicted on first backward-compile consumption.
+# Lifetime: each entry is inserted by capture (forward) and removed by the
+# matching backward compile (propagate_spyre_tensor_layouts pops it, by the same
+# graph_id).  Most entries drain this way, so no size cap is needed.  An entry
+# lingers only when its backward never compiles — e.g. an unused static/dynamic
+# forward variant, an inference-only forward, or a backward served from the
+# compile cache (whose consumer pass does not run).  Residue is bounded to at
+# most one entry per forward graph_id, and a later forward re-compiled under the
+# same graph_id overwrites it, so the registry stays small in practice.
+# Concurrency: the two mutations are a single-key insert (capture) and a
+# single-key pop-with-default (consume), each atomic under the GIL, so no lock is
+# required.
 #
 # Cache caveat: capture runs as a forward pre-scheduling pass, so it does NOT run
 # when the forward is served from a compile cache.  When both forward and backward
@@ -121,10 +129,61 @@ spyreop = torch.ops.spyre
 # wrong gradients) the backward pass fails loud.  A fully cache-proof design
 # (serializing these layouts with the cached forward) is left as follow-up.
 # ---------------------------------------------------------------------------
-_FWD_LAYOUT_REGISTRY_MAX_GRAPHS = 64
 
 # graph_id -> {FX-output-node-name: committed forward-output STL}
 _forward_output_layouts: dict[int, dict[str, "SpyreTensorLayout"]] = {}
+
+
+def forward_output_layouts_for(
+    graph_id: int | None,
+) -> dict[str, "SpyreTensorLayout"]:
+    """Return a snapshot of the captured forward-output STLs for ``graph_id``.
+
+    Used by the backward FxGraph cache-key patch (in ``_monkey_patch``) to
+    disambiguate backward graphs whose saved-activation inputs reuse different
+    forward output layouts.  Two structurally identical backward graphs whose
+    saved activations were laid out differently by their respective forward
+    optimizers must not share a cache entry; their forward-output STLs are the
+    only Spyre state that distinguishes them (device tiling is not reflected in
+    the FakeTensor placeholder strides that the standard hash already covers).
+
+    Read-only and non-evicting: the cache key is computed *before*
+    ``propagate_spyre_tensor_layouts`` runs (and pops the entry), and a cache
+    *hit* never runs propagation at all, so this must not mutate the registry.
+    Returns an empty dict when nothing was captured (e.g. the forward was served
+    from a compile cache, so ``capture_forward_output_layouts`` never ran).
+    """
+    if graph_id is None:
+        return {}
+    return dict(_forward_output_layouts.get(graph_id, {}))
+
+
+# graph_id -> {input-position: (input-name, committed tangent STL)}
+#
+# A backward "tangents_N" input is given an IR-derived default layout at compile
+# time (propagate_spyre_tensor_layouts); its REAL layout is chosen by the upstream
+# grad producer and is only known when .backward() runs.  capture_backward_tangent
+# _layouts records each tangent's committed device layout here (after
+# finalize_layouts) so the _bw_wrapper runtime guard can compare the real tangent
+# against it and fail loud on a mismatch instead of computing wrong gradients
+# (review comment [7]).  Keyed by input POSITION because the compiled backward is
+# called with a positional args list ordered like graph.graph_input_names.
+_backward_tangent_layouts: dict[int, dict[int, tuple[str, "SpyreTensorLayout"]]] = {}
+
+
+def pop_backward_tangent_layouts(
+    graph_id: int | None,
+) -> dict[int, tuple[str, "SpyreTensorLayout"]]:
+    """Remove and return recorded tangent layouts for a backward ``graph_id``.
+
+    Consumed once by the _bw_wrapper runtime-guard installer after the backward
+    compiles.  pop-with-default is atomic (no check-then-pop race).  Empty when no
+    tangent layouts were captured (e.g. the backward was served from a compile
+    cache, so its consumer pass never ran — the guard is simply not installed).
+    """
+    if graph_id is None:
+        return {}
+    return _backward_tangent_layouts.pop(graph_id, {})
 
 
 class PropArg(NamedTuple):
@@ -1119,8 +1178,8 @@ def capture_forward_output_layouts(graph: GraphLowering) -> None:
     inputs must use.  (Tangent inputs are deliberately not recorded — see the
     _forward_output_layouts registry comment.)
 
-    Entries are evicted when the backward compile consumes them; a size cap
-    (_FWD_LAYOUT_REGISTRY_MAX_GRAPHS) is a backstop against leaks.
+    Each entry is removed when the matching backward compile consumes it, so the
+    registry self-drains; see the registry comment for lifetime/concurrency.
     """
     if graph.is_backward:
         return
@@ -1148,11 +1207,7 @@ def capture_forward_output_layouts(graph: GraphLowering) -> None:
     if not by_name:
         return
 
-    # Evict oldest entries if at capacity.
-    if len(_forward_output_layouts) >= _FWD_LAYOUT_REGISTRY_MAX_GRAPHS:
-        oldest = next(iter(_forward_output_layouts))
-        del _forward_output_layouts[oldest]
-
+    # Single-key insert; the matching backward compile pops it (self-draining).
     _forward_output_layouts[graph_id] = by_name
     logger.debug(
         "capture_forward_output_layouts: graph_id=%s recorded %d output "
@@ -1164,120 +1219,208 @@ def capture_forward_output_layouts(graph: GraphLowering) -> None:
     )
 
 
+def capture_backward_tangent_layouts(graph: GraphLowering) -> None:
+    """Record each backward tangent input's committed device layout.
+
+    Runs as a pre-scheduling pass after finalize_layouts on backward graphs; at
+    that point each tangent's InputBuffer carries a committed FixedTiledLayout.
+    A tangent's SpyreTensorLayout is only a compile-time *assumption* (the
+    IR-derived default assigned by propagate_spyre_tensor_layouts) — its real
+    layout is chosen by the upstream grad producer at .backward() time.  We record
+    the committed layout keyed by graph_id and input position so the _bw_wrapper
+    runtime guard can verify the real tangent matches it and fail loud on a
+    mismatch, rather than silently producing wrong gradients (review comment [7]).
+    No-op on forward graphs.
+    """
+    if not graph.is_backward:
+        return
+    graph_id = graph.graph_id
+    if graph_id is None:
+        return
+
+    by_index: dict[int, tuple[str, SpyreTensorLayout]] = {}
+    for idx, name in enumerate(graph.graph_input_names):
+        if _tangent_output_index(name) is None:
+            continue
+        tb = graph.graph_inputs.get(name)
+        layout = getattr(
+            getattr(getattr(tb, "data", None), "data", None), "layout", None
+        )
+        device_layout = getattr(layout, "device_layout", None)
+        if device_layout is not None:
+            by_index[idx] = (name, device_layout)
+
+    if not by_index:
+        return
+    _backward_tangent_layouts[graph_id] = by_index
+    logger.debug(
+        "capture_backward_tangent_layouts: graph_id=%s recorded %d tangent "
+        "layouts at positions %s",
+        graph_id,
+        len(by_index),
+        sorted(by_index.keys()),
+    )
+
+
+def _is_input_buffer_box(tb) -> bool:
+    """True if ``tb`` is the ``TensorBox(StorageBox(InputBuffer))`` expected for a
+    real (tensor) graph input.  Non-tensor inputs (SymInt / BackwardState) are not.
+    """
+    return (
+        isinstance(tb, TensorBox)
+        and isinstance(tb.data, StorageBox)
+        and isinstance(tb.data.data, InputBuffer)
+    )
+
+
+def _consume_forward_output_layouts(
+    graph: GraphLowering,
+) -> dict[str, "SpyreTensorLayout"]:
+    """Pop this backward graph's captured forward-output STLs (saved activations).
+
+    pop-with-default is a single atomic op, so concurrent compiles cannot race a
+    separate ``in`` check against the pop (no KeyError).
+    """
+    graph_id = graph.graph_id
+    fwd_by_name = (
+        _forward_output_layouts.pop(graph_id, {}) if graph_id is not None else {}
+    )
+    if fwd_by_name:
+        logger.debug(
+            "propagate_spyre_tensor_layouts: backward graph_id=%s consuming %d "
+            "forward saved-activation layouts",
+            graph_id,
+            len(fwd_by_name),
+        )
+    return fwd_by_name
+
+
+def _resolve_forward_input_stl(name: str, real_input):
+    """STL for a forward graph input, taken from its real Spyre tensor.
+
+    Returns None for a non-tensor input (SymInt / BackwardState).  Raises if a real
+    Spyre tensor is missing its device layout (all real Spyre tensors have one).
+    """
+    if isinstance(real_input, torch.Tensor) and hasattr(
+        real_input, "device_tensor_layout"
+    ):
+        stl = real_input.device_tensor_layout()
+        if stl is None:
+            raise Unsupported(f"missing device_tensor_layout on graph input {name}")
+        return stl
+    return None
+
+
+def _resolve_backward_saved_activation_stl(name: str, fwd_by_name: dict):
+    """STL for a backward saved-activation input: exact FX-name match against the
+    layouts captured from the forward outputs.  None if this input is not a matched
+    saved activation (i.e. a tangent, SymInt, or BackwardState).
+    """
+    stl = fwd_by_name.get(name)
+    if stl is not None:
+        logger.debug(
+            "propagate_spyre_tensor_layouts: backward input %r matched forward "
+            "saved-activation layout %r",
+            name,
+            stl,
+        )
+    return stl
+
+
+# Sentinel: this graph input has no InputBuffer (SymInt / BackwardState); skip it.
+_SKIP_INPUT = object()
+
+
+def _resolve_graph_input_stl(name, real_input, graph, fwd_by_name):
+    """Resolve the SpyreTensorLayout for one graph input.
+
+    Splits into the forward and backward cases (review comments [13]/[14]):
+      * forward          -> from the real Spyre tensor's device layout.
+      * backward saved   -> from the captured forward-output layout (FX-name match).
+      * backward tangent -> IR-derived default (real layout verified at runtime by
+                            the _bw_wrapper guard; see review comment [7]).
+    Returns the STL, or ``_SKIP_INPUT`` for a non-tensor input.  Raises for an
+    unmatched non-tangent backward input (forward served from a compile cache).
+    """
+    if graph.is_backward:
+        stl = _resolve_backward_saved_activation_stl(name, fwd_by_name)
+    else:
+        stl = _resolve_forward_input_stl(name, real_input)
+    if stl is not None:
+        return stl
+
+    # No STL yet: either a non-tensor input (skip) or a backward tangent (default).
+    tb = graph.graph_inputs[name]
+    if not _is_input_buffer_box(tb):
+        return _SKIP_INPUT
+    if graph.is_backward and _tangent_output_index(name) is None:
+        # A real backward tensor input that is neither a matched saved activation
+        # nor a tangent.  Its true layout is a forward output we should have
+        # recorded; not finding it means the forward was served from a compile
+        # cache (so capture did not run).  Guessing a shape-derived default risks
+        # silently wrong gradients, so fail loud instead.  A fully cache-proof
+        # design (persisting these layouts with the cached forward) is follow-up.
+        raise Unsupported(
+            f"backward saved-activation input {name!r} has no recorded forward "
+            f"layout (graph_id={graph.graph_id}); the forward graph was likely "
+            f"served from a compile cache so its output layouts were not captured. "
+            f"Recompile with TORCHINDUCTOR_FORCE_DISABLE_CACHES=1, or clear the "
+            f"inductor cache, to compile the forward and backward together."
+        )
+    ptl = tb.data.data.layout
+    stl = SpyreTensorLayout([concretize_expr(s) for s in ptl.size], ptl.dtype)
+    if graph.is_backward:
+        # Tangent: its real layout is set by the upstream grad_fn output, not known
+        # at compile time.  Use an IR-derived default (last-dim stick); the
+        # _bw_wrapper runtime guard rejects a mismatch (review comment [7]).
+        logger.debug(
+            "propagate_spyre_tensor_layouts: backward tangent %r using IR-derived "
+            "default layout %r",
+            name,
+            stl,
+        )
+    return stl
+
+
+def _assign_graph_input_layouts(graph: GraphLowering) -> None:
+    """Convert each graph input's FixedLayout to a SpyreTensorLayout.
+
+    The input-resolution "first portion" of propagate_spyre_tensor_layouts,
+    extracted per review comments [13]/[14].
+
+    Forward graph: V.get_real_inputs() holds the actual Spyre tensors with their
+    physical device_tensor_layout — use those directly.  Backward graph:
+    AOTAutograd calls compile_fx_backward outside the forward's
+    enable_spyre_context, so example_inputs are FakeTensors (device_tensor_layout()
+    is None by design); saved activations reuse the captured forward-output layouts
+    (FX-name match), tangents fall through to an IR-derived default, and an
+    unmatched non-tangent fails loud.  See the _resolve_* helpers.
+    """
+    if not graph.graph_input_names:
+        return
+    fwd_by_name = _consume_forward_output_layouts(graph) if graph.is_backward else {}
+    inputs_to_zip = graph.example_inputs if graph.is_backward else V.get_real_inputs()
+    for name, real_input in zip(graph.graph_input_names, inputs_to_zip):
+        stl = _resolve_graph_input_stl(name, real_input, graph, fwd_by_name)
+        if stl is _SKIP_INPUT:
+            continue
+        tb = graph.graph_inputs[name]
+        if not _is_input_buffer_box(tb):
+            raise Unsupported(
+                f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+            )
+        if not isinstance(tb.data.data.layout, FixedLayout):
+            raise Unsupported(f"graph input {name} does not have a FixedLayout")
+        tb.layouts = [stl]
+
+
 def propagate_spyre_tensor_layouts(
     graph: GraphLowering,
 ) -> None:
     operations = graph.operations
-    # Convert InputBuffers from FixedLayout to SpyreTensorLayouts.
-    #
-    # Forward graph: V.get_real_inputs() holds the actual Spyre tensors with
-    # their physical device_tensor_layout — use those directly.
-    #
-    # Backward graph: AOTAutograd calls compile_fx_backward outside the forward's
-    # enable_spyre_context, so example_inputs are FakeTensors.  FakeTensors return
-    # None from device_tensor_layout() by design (no real SpyreTensorImpl storage).
-    # Instead, look up the saved-activation layouts recorded by
-    # capture_forward_output_layouts (keyed by graph_id) — a backward saved
-    # activation is a forward output, matched by its FX output-node name.  Tangent
-    # inputs are the gradients of the forward user outputs; their layout is set by
-    # the upstream grad producer, not by this forward, so they fall through to an
-    # IR-derived default.  A non-tangent input that is NOT in the registry means
-    # the forward layouts are unavailable (forward served from a compile cache);
-    # we fail loud rather than guess and risk wrong gradients.
-    if len(graph.graph_input_names) > 0:
-        if graph.is_backward:
-            # Retrieve (and evict) the forward output layouts for this AOT graph.
-            graph_id = graph.graph_id
-            fwd_by_name: dict[str, SpyreTensorLayout] = {}
-            if graph_id is not None and graph_id in _forward_output_layouts:
-                fwd_by_name = _forward_output_layouts.pop(graph_id)
-                logger.debug(
-                    "propagate_spyre_tensor_layouts: backward graph_id=%s "
-                    "consuming %d forward saved-activation layouts",
-                    graph_id,
-                    len(fwd_by_name),
-                )
-
-        inputs_to_zip = (
-            graph.example_inputs if graph.is_backward else V.get_real_inputs()
-        )
-        for name, real_input in zip(graph.graph_input_names, inputs_to_zip):
-            stl = None
-            if graph.is_backward:
-                # Saved activation — exact FX output-node name match.
-                stl = fwd_by_name.get(name)
-                if stl is not None:
-                    logger.debug(
-                        "propagate_spyre_tensor_layouts: backward input %r "
-                        "matched forward saved-activation layout %r",
-                        name,
-                        stl,
-                    )
-            elif isinstance(real_input, torch.Tensor) and hasattr(
-                real_input, "device_tensor_layout"
-            ):
-                stl = real_input.device_tensor_layout()
-                if stl is None:
-                    # All real Spyre tensors are created with device layouts.
-                    raise Unsupported(
-                        f"missing device_tensor_layout on graph input {name}"
-                    )
-
-            if stl is None:
-                # Backward input with no registry match (tangent, SymInt, or
-                # BackwardState).  Try to derive a default layout from the IR.
-                tb = graph.graph_inputs[name]
-                if not (
-                    isinstance(tb, TensorBox)
-                    and isinstance(tb.data, StorageBox)
-                    and isinstance(tb.data.data, InputBuffer)
-                ):
-                    continue
-                if graph.is_backward and _tangent_output_index(name) is None:
-                    # A real tensor backward input that is neither a matched saved
-                    # activation nor a tangent.  Its true layout is a forward
-                    # output we should have recorded; not finding it means the
-                    # forward was served from a compile cache (so capture did not
-                    # run).  Guessing a shape-derived default risks silently wrong
-                    # gradients, so fail loud instead.  A fully cache-proof design
-                    # (persisting these layouts with the cached forward) is
-                    # follow-up work.
-                    raise Unsupported(
-                        f"backward saved-activation input {name!r} has no recorded "
-                        f"forward layout (graph_id={graph.graph_id}); the forward "
-                        f"graph was likely served from a compile cache so its "
-                        f"output layouts were not captured. Recompile with "
-                        f"TORCHINDUCTOR_FORCE_DISABLE_CACHES=1, or clear the "
-                        f"inductor cache, to compile the forward and backward "
-                        f"together."
-                    )
-                ptl = tb.data.data.layout
-                c_size = [concretize_expr(s) for s in ptl.size]
-                stl = SpyreTensorLayout(c_size, ptl.dtype)
-                if graph.is_backward:
-                    # Tangent: its layout is determined by the upstream grad_fn
-                    # output, not known at compile time.  Derive a default
-                    # (last-dim stick) and log it so mismatches are visible.
-                    logger.debug(
-                        "propagate_spyre_tensor_layouts: backward tangent %r "
-                        "using IR-derived default layout %r",
-                        name,
-                        stl,
-                    )
-
-            tb = graph.graph_inputs[name]
-            if (
-                not isinstance(tb, TensorBox)
-                or not isinstance(tb.data, StorageBox)
-                or not isinstance(tb.data.data, InputBuffer)
-            ):
-                raise Unsupported(
-                    f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
-                )
-            ptl = tb.data.data.layout
-            if not isinstance(ptl, FixedLayout):
-                raise Unsupported(f"graph input {name} does not have a FixedLayout")
-            tb.layouts = [stl]
+    # Convert each graph input's FixedLayout to a SpyreTensorLayout (forward vs
+    # backward sourcing differ; see the helper).
+    _assign_graph_input_layouts(graph)
 
     # Alt layout each graph input has been forced to by a mutation write, so a
     # second write can detect a conflicting alt.

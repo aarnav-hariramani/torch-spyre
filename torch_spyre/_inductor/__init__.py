@@ -71,6 +71,11 @@ def enable_spyre_compile_fx_wrapper():
             out_puts = out_node.args[0] if out_node.args else []
             for n in iter_nodes(out_puts):
                 meta = getattr(n, "meta", {}) or {}
+                # NB: use an explicit `is None` check, not
+                # `meta.get("val") or meta.get("example_value")`.  `a or b`
+                # evaluates bool(a), and meta["val"] on a backward output node is
+                # a multi-element FakeTensor, so bool() raises "Boolean value of
+                # Tensor with more than one value is ambiguous".
                 mv = meta.get("val", None)
                 if mv is None:
                     mv = meta.get("example_value", None)
@@ -134,12 +139,73 @@ def enable_spyre_compile_fx_wrapper():
             if _uses_spyre(gm, example_inputs):
                 decomps = torch._inductor.decomposition.decompositions
                 with enable_spyre_context([], decomps=decomps):
-                    return _orig_bw(gm, example_inputs, compiler_config_extra, **kwargs)
+                    compiled = _orig_bw(
+                        gm, example_inputs, compiler_config_extra, **kwargs
+                    )
+                # A backward tangent is given an assumed (IR-derived) layout at
+                # compile time; its real layout is only known when .backward()
+                # runs.  Install a runtime guard that rejects a mismatch instead
+                # of silently computing wrong gradients.
+                _install_backward_tangent_guard(compiled, compiler_config_extra)
+                return compiled
             return _orig_bw(gm, example_inputs, compiler_config_extra, **kwargs)
 
         cfx.compile_fx = _wrapper
         cfx.compile_fx_backward = _bw_wrapper
         cfx._spyre_wrapped = True
+
+
+def _install_backward_tangent_guard(compiled, compiler_config_extra):
+    """Wrap a compiled backward so each real tangent's device layout is verified.
+
+    The backward compiler assigns tangent inputs an assumed (IR-derived) layout;
+    the real layout is decided by the upstream grad producer and is only known at
+    execution time.  capture_backward_tangent_layouts recorded the committed
+    (assumed) layout per tangent position, keyed by graph_id.  Here we interpose
+    on the compiled graph's ``current_callable`` (the boxed callable invoked with a
+    positional args list ordered like graph.graph_input_names) to compare each
+    real tangent against the assumed layout, raising on a mismatch instead of
+    silently returning wrong gradients.
+
+    Interposing on ``current_callable`` (rather than wrapping the OutputCode) keeps
+    the object intact for the disk cache: _save_graph shallow-copies and nulls
+    current_callable before pickling, so this closure is never serialized.  A
+    cache-loaded backward reconstructs current_callable without the guard, but its
+    consumer pass never ran either, so there is nothing to verify against.
+    """
+    import torch
+    from .propagate_layouts import pop_backward_tangent_layouts
+    from .errors import Unsupported
+
+    graph_id = getattr(compiler_config_extra, "graph_id", None)
+    tangent_layouts = pop_backward_tangent_layouts(graph_id)
+    if not tangent_layouts:
+        return
+    inner = getattr(compiled, "current_callable", None)
+    if inner is None:
+        return
+
+    def guarded(inputs):
+        for idx, (name, assumed) in tangent_layouts.items():
+            if idx >= len(inputs):
+                continue
+            t = inputs[idx]
+            if not (isinstance(t, torch.Tensor) and hasattr(t, "device_tensor_layout")):
+                continue
+            actual = t.device_tensor_layout()
+            if actual is not None and actual != assumed:
+                raise Unsupported(
+                    f"backward tangent {name!r} arrived with device layout "
+                    f"{actual!r}, but the compiled backward assumed {assumed!r}. "
+                    f"The gradient producer chose a different layout than this "
+                    f"forward's output optimizer; running the kernel would read "
+                    f"the tangent with the wrong tiling and silently corrupt the "
+                    f"gradient. Relayout/recompile for arbitrary tangent layouts "
+                    f"is not yet supported."
+                )
+        return inner(inputs)
+
+    compiled.current_callable = guarded
 
 
 def _light_autoload():

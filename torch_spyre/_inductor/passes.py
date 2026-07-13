@@ -55,6 +55,7 @@ from .propagate_hints import (
 )
 from .propagate_named_dims import propagate_named_dims, assign_dim_hints
 from .propagate_layouts import (
+    capture_backward_tangent_layouts,
     capture_forward_output_layouts,
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
@@ -344,8 +345,12 @@ class CustomPreSchedulingPasses:
             finalize_layouts,
             # Record forward output STLs (committed by finalize_layouts) so the
             # lazily-compiled backward graph can reuse them for its saved-
-            # activation / tangent inputs.  No-op on backward graphs.
+            # activation inputs.  No-op on backward graphs.
             capture_forward_output_layouts,
+            # Record backward tangent STLs (committed by finalize_layouts) so the
+            # _bw_wrapper runtime guard can verify the real tangent matches the
+            # assumed layout.  No-op on forward graphs.
+            capture_backward_tangent_layouts,
             insert_restickify,
             insert_post_mutation_restickify,
             insert_bmm_padding,

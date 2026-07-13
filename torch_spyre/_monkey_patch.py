@@ -273,12 +273,45 @@ def _patch_fx_graph_hash():
         # run original first — populates all standard hash fields
         original_init(self, gm, example_inputs, fx_kwargs, inputs_to_check)
 
-        # For the forward graph, V.get_real_inputs() holds the actual Spyre tensors
-        # (with device_tensor_layout) and should be used for the cache key.
-        # For the backward graph, the backward compiler is called directly by
-        # AOTAutograd without going through compile_fx, so V.get_real_inputs() still
-        # points at the forward inputs — fall back to example_inputs (FakeTensors)
-        # which have no device_tensor_layout, contributing None to the hash.
+        # The Spyre device tiling (SpyreTensorLayout) chosen for a graph's inputs
+        # changes the generated code but is NOT reflected in the standard hash
+        # fields (FakeTensor placeholder strides do not encode device sticks), so
+        # we fold it into the cache key here.  Forward and backward graphs get
+        # their layouts from different places:
+        #
+        # Forward: V.get_real_inputs() holds the actual Spyre tensors, whose
+        # device_tensor_layout() is exactly what the layout passes will use.
+        #
+        # Backward: AOTAutograd compiles the backward lazily, outside the
+        # forward's enable_spyre_context; _bw_wrapper re-enters that context with
+        # an EMPTY real-inputs list, so V.get_real_inputs() is [] (not a
+        # NullHandler) and the FakeTensor example_inputs carry no device layout.
+        # Keying off those would leave every backward graph with an empty layout
+        # list, so two backwards whose saved activations were laid out differently
+        # by their forwards would collide and reuse each other's codegen.  Instead
+        # key off the forward-output STLs recorded by
+        # capture_forward_output_layouts (keyed by graph_id) — a backward
+        # saved-activation input is a forward output, and its STL is the only
+        # Spyre state that distinguishes two otherwise-identical backward graphs.
+        # (Tangent inputs get an IR-derived default that is a deterministic
+        # function of the already-hashed example_inputs shape+dtype, so they add
+        # no extra collision risk and need not be folded in here.  Their *real*
+        # runtime layout is not available at backward-compile time — the backward
+        # is compiled from FakeTensor placeholders — so verifying it is left to a
+        # runtime check, tracked separately.)
+        if bool(fx_kwargs.get("is_backward", False)):
+            from torch_spyre._inductor.propagate_layouts import (
+                forward_output_layouts_for,
+            )
+
+            fwd_layouts = forward_output_layouts_for(fx_kwargs.get("graph_id"))
+            # Deterministic, picklable representation keyed by FX output-node name
+            # (the backward saved-activation placeholder name).
+            self.spyre_layouts = [
+                (name, repr(fwd_layouts[name])) for name in sorted(fwd_layouts)
+            ]
+            return
+
         real_inputs = V.get_real_inputs()
         if isinstance(real_inputs, NullHandler):
             real_inputs = example_inputs
