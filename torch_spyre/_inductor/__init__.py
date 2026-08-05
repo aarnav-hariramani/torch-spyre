@@ -181,22 +181,35 @@ def enable_spyre_compile_fx_wrapper():
             # Use empty example_inputs for V.set_real_inputs - the backward
             # compiler uses graph.example_inputs (FakeTensors) for layout
             # propagation anyway (graph.is_backward == True).
-            if _uses_spyre(gm, example_inputs):
-                # NB: no ``decomps=`` here.  enable_spyre_context no longer installs
-                # a decomposition table (it is threaded through ``get_decomp_fn``
-                # instead); the backward graph is already decomposed as part of
-                # AOTAutograd's joint graph.
-                with enable_spyre_context([]):
-                    compiled = _orig_bw(
-                        gm, example_inputs, compiler_config_extra, **kwargs
-                    )
-                # A backward tangent is given an assumed (IR-derived) layout at
-                # compile time; its real layout is only known when .backward()
-                # runs.  Install a runtime guard that rejects a mismatch instead
-                # of silently computing wrong gradients.
-                _install_backward_tangent_guard(compiled, compiler_config_extra)
-                return compiled
-            return _orig_bw(gm, example_inputs, compiler_config_extra, **kwargs)
+            uses_spyre = _uses_spyre(gm, example_inputs)
+
+            # FFDC parity with the forward ``_wrapper``: a backward-compile
+            # failure must be captured too, otherwise the whole lazily-compiled
+            # backward path is invisible to failure-data collection.
+            try:
+                if uses_spyre:
+                    # NB: no ``decomps=`` here.  enable_spyre_context no longer
+                    # installs a decomposition table (it is threaded through
+                    # ``get_decomp_fn`` instead); the backward graph is already
+                    # decomposed as part of AOTAutograd's joint graph.
+                    with enable_spyre_context([]):
+                        compiled = _orig_bw(
+                            gm, example_inputs, compiler_config_extra, **kwargs
+                        )
+                    # A backward tangent is given an assumed (IR-derived) layout
+                    # at compile time; its real layout is only known when
+                    # .backward() runs.  Install a runtime guard that rejects a
+                    # mismatch instead of silently computing wrong gradients.
+                    _install_backward_tangent_guard(compiled, compiler_config_extra)
+                    return compiled
+
+                # Non-Spyre graphs: no FFDC — avoids capturing unrelated CPU
+                # compiles.
+                return _orig_bw(gm, example_inputs, compiler_config_extra, **kwargs)
+            except Exception as exc:
+                if uses_spyre:
+                    try_collect(exc, logger=logger, failure_category=CATEGORY_COMPILE)
+                raise
 
         cfx.compile_fx = _wrapper
         cfx.compile_fx_backward = _bw_wrapper

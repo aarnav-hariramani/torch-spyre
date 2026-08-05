@@ -344,7 +344,20 @@ def _patch_fx_graph_hash():
             ]
             return
 
-        real_inputs = V.get_real_inputs()
+        # Two distinct "no real inputs" cases, both of which must fall back to
+        # example_inputs rather than propagate:
+        #   * unset slot -> V.get_real_inputs() returns a NullHandler
+        #   * POISONED slot -> Virtualized._get_handler raises RuntimeError.
+        #     compile_fx_ext poisons every V slot absent from _VirtualizedSerializer's
+        #     field list (real_inputs is not one) under the non-default subprocess /
+        #     serde FxCompile schemes.  AOTAutogradCacheDetails subclasses this class
+        #     and autograd_cache_key re-raises anything that escapes, so letting the
+        #     RuntimeError out would turn a cache-key computation into a hard
+        #     compile failure.
+        try:
+            real_inputs = V.get_real_inputs()
+        except RuntimeError:
+            real_inputs = example_inputs
         if isinstance(real_inputs, NullHandler):
             real_inputs = example_inputs
 

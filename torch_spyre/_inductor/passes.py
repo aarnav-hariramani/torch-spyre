@@ -428,14 +428,6 @@ class CustomPreSchedulingPasses:
             validate_ops,
             optimize_restickify_locations,
             finalize_layouts,
-            # Record forward output STLs (committed by finalize_layouts) so the
-            # lazily-compiled backward graph can reuse them for its saved-
-            # activation inputs.  No-op on backward graphs.
-            capture_forward_output_layouts,
-            # Record backward tangent STLs (committed by finalize_layouts) so the
-            # _bw_wrapper runtime guard can verify the real tangent matches the
-            # assumed layout.  No-op on forward graphs.
-            capture_backward_tangent_layouts,
             insert_restickify,
             enforce_indirect_access_layout,
             insert_post_mutation_restickify,
@@ -447,6 +439,22 @@ class CustomPreSchedulingPasses:
             # These passes require FixedTiledLayout.device_layout (device_size,
             # stride_map, elems_per_stick) for physical span arithmetic.
             _maybe_coarse_tile_span_overflow,
+            #
+            # Backward layout bridge.  These record the layouts the compiled
+            # forward actually commits, for the lazily-compiled backward to reuse.
+            # They must run AFTER the last pass that can still change a committed
+            # FixedTiledLayout: _maybe_coarse_tile_span_overflow reaches
+            # _divide_ranges, which rewrites layout.size/stride and REBINDS
+            # layout.device_layout via _resize_device_layout, and can replace a
+            # graph-output buffer outright (_patch_graph_outputs).  Capturing
+            # before that would record a pre-division layout while codegen emits
+            # the post-division one, so the backward would lay out that saved
+            # activation with stale tiling -- silently wrong gradients, which the
+            # tangent guard cannot catch (it only inspects tangents_*).
+            capture_forward_output_layouts,
+            # Same ordering requirement for the tangent layouts the _bw_wrapper
+            # runtime guard verifies against.  No-op on forward graphs.
+            capture_backward_tangent_layouts,
             #
             # Core Division
             span_reduction,
