@@ -10,12 +10,17 @@ PYTEST_ARGS ?= -v
 TEST_CONFIGS ?= tests/configs/torch_spyre_tests
 
 # TEST_TYPE selects which suite subset to run:
-#   smoke          — fast sanity checks (~4 suites)
-#   core           — all functional tests, excludes special-purpose hardware
-#   full           — everything (core + LX-planning); default
-#   suite_<group>  — all configs inside the <group>/ sub-directory
-#                    (e.g. suite_inductor, suite_tensors)
-#   <label>        — any arbitrary label defined in test_suite_config.labels
+#   smoke            — fast sanity checks (~4 suites)
+#   core             — all functional tests, excludes special-purpose hardware
+#   device_critical  — device-layer surfaces flex and deeptools/dxp_standalone
+#                       exercise most: streams, job launch plans, codegen,
+#                       LX/scratchpad planning, tensor layout, allocator/GC,
+#                       D2D copies (used as the default in integration-tests.yaml,
+#                       triggered by those upstream repos)
+#   full             — everything (core + LX-planning); default for `make tests`
+#   suite_<group>    — all configs inside the <group>/ sub-directory
+#                      (e.g. suite_inductor, suite_tensors)
+#   <label>          — any arbitrary label defined in test_suite_config.labels
 # Empty / unset defaults to "full" (all configs under TEST_CONFIGS).
 TEST_TYPE ?= full
 
@@ -51,7 +56,8 @@ precommit: ## Run all pre-commit hooks against every file
 # ---------------------------------------------------------------------------
 
 .PHONY: tests
-tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|suite_<group>.
+tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|suite_<group>. TEST_CONFIGS may point at a config directory (filtered by TEST_TYPE) or a single config yaml file (run directly).
+ifneq ($(wildcard $(TEST_CONFIGS)/.),)
 	$(eval _PATHS := $(shell python3 $(FILTER_SCRIPT) \
 		--config-dir $(TEST_CONFIGS) \
 		--test-type "$(TEST_TYPE)" \
@@ -61,6 +67,13 @@ tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|sui
 		exit 1; \
 	fi
 	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(_PATHS) $(PYTEST_ARGS)
+else
+	@if [ ! -f "$(TEST_CONFIGS)" ]; then \
+		echo "ERROR: TEST_CONFIGS not found (expected a directory or a config file): $(TEST_CONFIGS)" >&2; \
+		exit 1; \
+	fi
+	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(TEST_CONFIGS) $(PYTEST_ARGS)
+endif
 
 
 # ---------------------------------------------------------------------------
@@ -80,4 +93,6 @@ clean: ## Remove auto-generated OOT wrappers, conftest files, merged configs, an
 	@find tests/ -name '_spyre_merged_config_*.yaml' -delete
 	@find tests/ -name '*.markers.json' -delete
 	@find tests/ -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+	@rm -rf torch_spyre.egg-info
+	@rm -rf tests/oot_framework/oot_framework.egg-info
 	@echo "Cleaned auto-generated files under tests/"

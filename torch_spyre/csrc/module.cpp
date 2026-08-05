@@ -21,8 +21,8 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
-#include <util/sen_data_convert.h>
-#include <util/sendefs.h>
+#include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
+#include <util/sendefs/sendefs.h>
 
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
@@ -41,6 +41,8 @@
 #endif
 
 #include "logging.h"
+#include "logging_bindings.h"
+#include "logging_config.h"
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
@@ -92,6 +94,9 @@ void _startRuntime() {
     logical_device_id = tls_idx;
   } else if (const char* lr = std::getenv("LOCAL_RANK")) {
     logical_device_id = std::atoi(lr);
+    // Match the current (c10) device to the rank so unqualified stream/pool
+    // lookups don't fall back to spyre:0.
+    SpyreGuardImpl::tls_idx = static_cast<c10::DeviceIndex>(logical_device_id);
   }
 
   const int num_devices = getVisibleDeviceCount();
@@ -195,10 +200,14 @@ PYBIND11_MODULE(_C, m) {
   m.def("device_count", &spyre::getVisibleDeviceCount);
   m.def("encode_constant", &spyre::encodeConstant);
 
+  // Initialize logging bindings
+  torch_spyre::logging::init_logging_bindings(m);
+
   py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
       .value("STANDARD", spyre::ElementArrangement::STANDARD)
       .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
       .value("QFP8CH", spyre::ElementArrangement::QFP8CH)
+      .value("FP32_TO_DL16", spyre::ElementArrangement::FP32_TO_DL16)
       .value("EXX2", spyre::ElementArrangement::EXX2);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
@@ -338,6 +347,11 @@ PYBIND11_MODULE(_C, m) {
         "Copy tensor between host and device using DMA", py::arg("self"),
         py::arg("dst"), py::arg("non_blocking") = false);
 
+  // Device-side fill using FillDMA (no host buffer or H2D copy)
+  m.def("fill_tensor", &spyre::spyre_fill_tensor,
+        "Fill a spyre tensor with a scalar value using device-side FillDMA",
+        py::arg("self"), py::arg("value"));
+
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
         py::arg("priority") = 0,
@@ -351,6 +365,13 @@ PYBIND11_MODULE(_C, m) {
 
   m.def("default_stream", &spyre::getDefaultStream, py::arg("device"),
         "Get the default stream for a device");
+
+  m.def("host_compute_stream", &spyre::getHostComputeStream, py::arg("device"),
+        "Get a host compute stream for a device (round-robin)");
+
+  m.def("host_compute_stream_by_id", &spyre::getHostComputeStreamById,
+        py::arg("id"), py::arg("device"),
+        "Get a specific host compute stream by stream ID");
 
   m.def("synchronize", &spyre::synchronizeDevice,
         py::arg("device") = py::none(), "Synchronize a device or all devices");
@@ -422,6 +443,14 @@ PYBIND11_MODULE(_C, m) {
             }
           },
           py::arg("idx"), "Get the type of step at the given index")
+      .def(
+          "get_step_pipeline_barrier",
+          [](const spyre::JobPlan& plan, size_t idx) {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            return plan.steps[idx]->getPipelineBarrier();
+          },
+          py::arg("idx"),
+          "Get the pipeline_barrier flag for the step at the given index")
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +
@@ -488,4 +517,13 @@ PYBIND11_MODULE(_C, m) {
         allocator.resetPeakStats(device);
       },
       py::arg("device"), "Reset peak allocator statistics");
+
+  // Returns true if any stream in the runtime has been shut down
+  // (unrecoverable). When true, no further work can be submitted on the
+  // affected streams.
+  m.def("has_stream_error", []() -> bool {
+    auto runtime = spyre::GlobalRuntime::get();
+    if (!runtime) return false;
+    return runtime->hasStreamError();
+  });
 }
