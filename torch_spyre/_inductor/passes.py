@@ -312,6 +312,15 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
 
 @_runs(
     reorder_unhinted_interlopers,
+)
+def _maybe_reorder_unhinted_interlopers(graph: GraphLowering) -> None:
+    """Move unhinted ComputedBuffer ops that interrupt hint-group runs."""
+    if config.ignore_wsr_hints:
+        return
+    reorder_unhinted_interlopers(graph)
+
+
+@_runs(
     hints_to_coarse_tile_groups,
     validate_coarse_tile_groups,
     coarse_tile,
@@ -324,7 +333,6 @@ def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
     """
     if config.ignore_wsr_hints:
         return
-    reorder_unhinted_interlopers(graph)
     groups = hints_to_coarse_tile_groups(graph)
     if not groups:
         return
@@ -420,6 +428,7 @@ class CustomPreSchedulingPasses:
             propagate_named_dims,
             validate_named_dims,
             assign_dim_hints,
+            _maybe_reorder_unhinted_interlopers,
             _maybe_coarse_tile_hints,
             #
             # Tensor Layout (Stickification)
