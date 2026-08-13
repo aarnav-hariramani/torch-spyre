@@ -2094,9 +2094,7 @@ def _assign_graph_input_layouts(graph: GraphLowering) -> None:
         # ``stl`` is passed explicitly because a backward placeholder is a
         # FakeTensor whose device_tensor_layout() is None; on the forward path
         # ``stl`` is that same device_tensor_layout(), so behaviour is unchanged.
-        is_tangent = (
-            graph.is_backward and _tangent_output_index(name) is not None
-        )
+        is_tangent = graph.is_backward and _tangent_output_index(name) is not None
         if isinstance(real_input, torch.Tensor) and not is_tangent:
             new_layout = _eager_view_input_layout(real_input, ptl, name, stl)
             if new_layout is not None:
