@@ -67,6 +67,7 @@ from .constants import (
     TOPK_OPS,
 )
 from .ir import (
+    AllReduceAsyncFallback,
     FixedTiledLayout,
     SpyreConstantFallback,
     SpyreEmptyFallback,
@@ -2360,7 +2361,15 @@ def propagate_spyre_tensor_layouts(
             if op.get_layout().device.type == DEVICE_NAME:
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
-        elif isinstance(op, (BroadcastAsyncFallback, WaitWorkFallback)):
+
+        elif isinstance(
+            op,
+            (
+                BroadcastAsyncFallback,
+                WaitWorkFallback,
+                AllReduceAsyncFallback,
+            ),
+        ):
             input_name = op.inputs[0].get_name()
             input_buf = V.graph.get_buffer(input_name)
             op.layouts = list(input_buf.layouts)
