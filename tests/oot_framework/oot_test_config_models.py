@@ -953,6 +953,19 @@ class InputsEdits(BaseModel):
                         f"config so the constructor arg uses 'config_path' + "
                         f"'config_kwargs' instead of a bare '<config:...>' value."
                     )
+                # A dtype recorded as its repr (e.g. 'torch.bfloat16'). Left as
+                # a string it reaches the op as a positional arg and is
+                # misinterpreted -- x.to('torch.bfloat16') parses it as a
+                # DEVICE string and raises. kwargs already resolve dtypes;
+                # positional values get the same treatment. Gated on a known
+                # dtype name so device strings ('cpu', 'cuda:0') and any other
+                # 'torch.'-prefixed value fall through unchanged.
+                if (
+                    isinstance(val, str)
+                    and val.startswith("torch.")
+                    and val.removeprefix("torch.") in _VALID_DTYPE_STRINGS
+                ):
+                    val = _resolve_dtype_str(val)
                 if (
                     test_device is not None
                     and op_name == "torch.to"

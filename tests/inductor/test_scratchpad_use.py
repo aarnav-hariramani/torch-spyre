@@ -59,7 +59,7 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
         def __call__(self, graph):
             calls.append(graph)
 
-    graph = SimpleNamespace()
+    graph = SimpleNamespace(graph=SimpleNamespace(owning_module=None))
     with (
         patch.object(passes, "CustomPreSchedulingPasses", CountingPreSchedulingPasses),
         patch.object(GraphLowering, "_update_scheduler", lambda _self: None),
@@ -1917,7 +1917,11 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 }
 
         with self.pre_scheduling_iterating_pass(visit):
-            with ts_inductor_config.patch(lx_planning=True):
+            # In-place reuse of boundary-clone buffers is a paired-buffer feature
+            # of the greedy build path (only the greedy solver sets
+            # supports_paired_buffers). Pin it so the slot-sharing assertion holds
+            # regardless of the default layout_solver.
+            with ts_inductor_config.patch(lx_planning=True, layout_solver="greedy"):
                 result = torch.compile(fn, fullgraph=True)(x).to("cpu")
 
         # Group LX-resident buffers by address; a shared address == in-place reuse.

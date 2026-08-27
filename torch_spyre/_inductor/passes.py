@@ -38,7 +38,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding
+from .padding import insert_bmm_padding, insert_restickify_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -54,7 +54,6 @@ from .wsr.coarse_tile_hints import (
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
-    recover_spyre_hints,
 )
 from .wsr.propagate_named_dims import (
     propagate_named_dims,
@@ -72,6 +71,7 @@ from .insert_restickify import (
     finalize_layouts,
     insert_post_mutation_restickify,
     insert_restickify,
+    validate_no_restickify_on_mutation_targets,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
@@ -240,7 +240,6 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
     def __init__(self):
         super().__init__(
             [
-                recover_spyre_hints,
                 # Undo the post-grad re-fusion of add(input, mm(a, b)) back into
                 # aten.addmm, so the resulting mul.Scalar alpha/beta nodes (whose
                 # constants are materialized later by the LoopLevel IR multi-ops
@@ -469,8 +468,10 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
+            validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             insert_post_mutation_restickify,
+            insert_restickify_padding,
             insert_bmm_padding,
             #
             dedup_and_promote_constants,
